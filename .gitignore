@@ -4,4 +4,5 @@ __pycache__/
 *.pyc
 seen_matches.json
 subscribers.json
+seat_state.json
 monitor.log

@@ -25,12 +25,19 @@ TAZKARTI_URL = (
     "https://www.tazkarti.com/booksprt/matches/getMatches"
     "?NewRequest=true&allowPaging=false"
 )
+SEAT_URL_TEMPLATE = (
+    "https://www.tazkarti.com/data/TicketPrice-AvailableSeats-{match_id}.json"
+)
+# Filter seat categories to only Zamalek's allocation (the opposing team gets
+# a different teamId inside the same match response).
+ZAMALEK_TEAM_ID = int(os.environ.get("ZAMALEK_TEAM_ID", "79"))
 # DATA_DIR lets us point state files at a Railway volume in production.
 # Locally, defaults to the project folder.
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "seen_matches.json"
 SUBS_FILE = DATA_DIR / "subscribers.json"
+SEAT_STATE_FILE = DATA_DIR / "seat_state.json"
 LOG_FILE = DATA_DIR / "monitor.log"
 
 ZAMALEK_KEYWORDS = ("zamalek", "zamlek", "زمالك", "الزمالك")
@@ -104,6 +111,22 @@ def save_subs(data: dict) -> None:
     )
 
 
+def load_seat_state() -> dict:
+    """Map of {match_id_str: {ticketPriceID_str: {"soldOut": bool, "availableSeats": int}}}."""
+    if not SEAT_STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(SEAT_STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_seat_state(state: dict) -> None:
+    SEAT_STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
 # ---------- tazkarti ----------
 
 def is_zamalek(match: dict) -> bool:
@@ -128,6 +151,16 @@ def fetch_matches() -> list[dict]:
     return data
 
 
+def fetch_seat_categories(match_id: int) -> list[dict]:
+    url = SEAT_URL_TEMPLATE.format(match_id=match_id)
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    payload = r.json()
+    if not payload.get("isSuccessful", True):
+        raise ValueError(f"Seat API not successful for {match_id}: {payload.get('error')}")
+    return payload.get("data") or []
+
+
 def format_alert(match: dict) -> str:
     t1 = match.get("teamNameAr1") or match.get("teamName1") or "?"
     t2 = match.get("teamNameAr2") or match.get("teamName2") or "?"
@@ -145,6 +178,28 @@ def format_alert(match: dict) -> str:
         f"🏆 {tournament}\n"
         f"📅 {kickoff}\n"
         f"🎯 {round_name}\n\n"
+        "👉 https://www.tazkarti.com/#/matches"
+    )
+
+
+def format_seat_alert(match: dict, category: dict) -> str:
+    t1 = match.get("teamNameAr1") or match.get("teamName1") or "?"
+    t2 = match.get("teamNameAr2") or match.get("teamName2") or "?"
+    cat_name = (
+        category.get("categoryNameAr")
+        or category.get("categoryName")
+        or "?"
+    )
+    price = category.get("price", "?")
+    seats = category.get("availableSeats", "?")
+    ticket_id = category.get("ticketPriceID", "?")
+    return (
+        "🟢 تذكرة بقت متاحة للزمالك!\n\n"
+        f"⚽ {t1}  vs  {t2}\n"
+        f"🎟️ الفئة: {cat_name}\n"
+        f"💰 السعر: {price} جنيه\n"
+        f"🪑 المقاعد: {seats}\n"
+        f"🆔 ticketPriceID: {ticket_id}\n\n"
         "👉 https://www.tazkarti.com/#/matches"
     )
 
@@ -202,9 +257,27 @@ def poll_updates(subs_data: dict) -> dict:
         if chat_id is None:
             continue
         chat_id_s = str(chat_id)
-        text = (msg.get("text") or "").strip().lower()
+        raw_text = (msg.get("text") or "").strip()
+        text = raw_text.lower()
 
-        if text.startswith("/start"):
+        if text.startswith("/broadcast"):
+            if chat_id_s != OWNER_CHAT_ID:
+                tg_send(chat_id, "🚫 الأمر ده للأدمن بس.")
+                continue
+            body = raw_text[len("/broadcast"):].strip()
+            if not body:
+                tg_send(
+                    chat_id,
+                    "اكتب الرسالة بعد الأمر:\n/broadcast نص الرسالة هنا",
+                )
+                continue
+            sent = broadcast(subs_data, body)
+            tg_send(
+                chat_id,
+                f"✅ اتبعتت لـ {sent}/{len(subs)} مشترك.",
+            )
+            log(f"Owner broadcast sent to {sent}/{len(subs)}: {body[:80]!r}")
+        elif text.startswith("/start"):
             if chat_id_s not in subs:
                 subs[chat_id_s] = {
                     "name": chat.get("first_name") or chat.get("title") or "?",
@@ -270,7 +343,70 @@ def ensure_owner_subscribed(subs_data: dict) -> None:
         log(f"Auto-added owner chat {OWNER_CHAT_ID} as subscriber")
 
 
-def check_once(seen: set[int], subs_data: dict) -> set[int]:
+def check_seats(match: dict, seat_state: dict, subs_data: dict) -> None:
+    """Fetch per-category seat availability and broadcast on sold-out -> available."""
+    mid = match.get("matchId")
+    if mid is None:
+        return
+    mid_s = str(mid)
+    try:
+        categories = fetch_seat_categories(mid)
+    except (requests.RequestException, ValueError) as e:
+        log(f"Seat fetch failed for match {mid}: {e}")
+        return
+
+    categories = [c for c in categories if c.get("teamId") == ZAMALEK_TEAM_ID]
+    if not categories:
+        log(f"No Zamalek-side categories (teamId={ZAMALEK_TEAM_ID}) for match {mid}")
+        return
+
+    prev = seat_state.get(mid_s)
+    snapshot = {}
+    for c in categories:
+        tid = c.get("ticketPriceID")
+        if tid is None:
+            continue
+        snapshot[str(tid)] = {
+            "soldOut": bool(c.get("soldOut", True)),
+            "availableSeats": int(c.get("availableSeats") or 0),
+        }
+
+    if prev is None:
+        seat_state[mid_s] = snapshot
+        available_now = sum(1 for v in snapshot.values() if not v["soldOut"])
+        log(
+            f"Init seat state for match {mid} — "
+            f"{len(snapshot)} categories, {available_now} available (silent)"
+        )
+        return
+
+    transitions = []
+    for c in categories:
+        tid = c.get("ticketPriceID")
+        if tid is None:
+            continue
+        tid_s = str(tid)
+        cur_sold = bool(c.get("soldOut", True))
+        prev_entry = prev.get(tid_s)
+        if prev_entry is None:
+            if not cur_sold:
+                transitions.append(c)
+        else:
+            if bool(prev_entry.get("soldOut", True)) and not cur_sold:
+                transitions.append(c)
+
+    seat_state[mid_s] = snapshot
+
+    for c in transitions:
+        log(
+            f"SEAT AVAILABLE for match {mid}: "
+            f"{c.get('categoryNameAr')} (ticketPriceID={c.get('ticketPriceID')})"
+        )
+        sent = broadcast(subs_data, format_seat_alert(match, c))
+        log(f"  -> alerted {sent}/{len(subs_data['subscribers'])} subscribers")
+
+
+def check_once(seen: set[int], subs_data: dict, seat_state: dict) -> set[int]:
     matches = fetch_matches()
     zamalek_matches = [m for m in matches if is_zamalek(m)]
     log(
@@ -292,6 +428,9 @@ def check_once(seen: set[int], subs_data: dict) -> set[int]:
         sent = broadcast(subs_data, format_alert(m))
         log(f"  -> alerted {sent}/{len(subs_data['subscribers'])} subscribers")
 
+    for m in zamalek_matches:
+        check_seats(m, seat_state, subs_data)
+
     return seen
 
 
@@ -303,19 +442,22 @@ def main() -> int:
     log(f"Starting monitor — polling every {POLL_INTERVAL_SECONDS}s")
     seen = load_seen()
     subs_data = load_subs()
+    seat_state = load_seat_state()
     ensure_owner_subscribed(subs_data)
     save_subs(subs_data)
     log(
         f"Loaded {len(seen)} seen matchId(s), "
-        f"{len(subs_data['subscribers'])} subscriber(s)"
+        f"{len(subs_data['subscribers'])} subscriber(s), "
+        f"{len(seat_state)} match(es) with seat state"
     )
 
     while True:
         try:
             subs_data = poll_updates(subs_data)
             save_subs(subs_data)
-            seen = check_once(seen, subs_data)
+            seen = check_once(seen, subs_data, seat_state)
             save_seen(seen)
+            save_seat_state(seat_state)
             save_subs(subs_data)
         except requests.RequestException as e:
             log(f"Network error: {e}")
