@@ -31,6 +31,12 @@ SEAT_URL_TEMPLATE = (
 # Filter seat categories to only Zamalek's allocation (the opposing team gets
 # a different teamId inside the same match response).
 ZAMALEK_TEAM_ID = int(os.environ.get("ZAMALEK_TEAM_ID", "79"))
+# Comma-separated matchIds to skip seat-availability checks for (still get
+# the "new match" alert if newly seen). Useful for matches already played
+# or no longer interesting.
+IGNORED_MATCH_IDS = {
+    int(x) for x in os.environ.get("IGNORED_MATCH_IDS", "").split(",") if x.strip()
+}
 # DATA_DIR lets us point state files at a Railway volume in production.
 # Locally, defaults to the project folder.
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
@@ -41,6 +47,8 @@ SEAT_STATE_FILE = DATA_DIR / "seat_state.json"
 # Append-only history: one JSON line per poll, per match. Used for
 # generating "what changed in the last N hours" reports later.
 SEAT_HISTORY_FILE = DATA_DIR / "seat_history.jsonl"
+# Time-triggered one-shot broadcasts. Edit this file to schedule messages.
+SCHEDULED_BROADCASTS_FILE = DATA_DIR / "scheduled_broadcasts.json"
 LOG_FILE = DATA_DIR / "monitor.log"
 
 ZAMALEK_KEYWORDS = ("zamalek", "zamlek", "زمالك", "الزمالك")
@@ -128,6 +136,55 @@ def save_seat_state(state: dict) -> None:
     SEAT_STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def load_scheduled_broadcasts() -> list[dict]:
+    if not SCHEDULED_BROADCASTS_FILE.exists():
+        return []
+    try:
+        data = json.loads(SCHEDULED_BROADCASTS_FILE.read_text(encoding="utf-8"))
+        return data.get("broadcasts", []) if isinstance(data, dict) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_scheduled_broadcasts(broadcasts: list[dict]) -> None:
+    SCHEDULED_BROADCASTS_FILE.write_text(
+        json.dumps({"broadcasts": broadcasts}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def check_scheduled_broadcasts(subs_data: dict) -> None:
+    """Send any due one-shot broadcasts. Each entry sent at most once."""
+    broadcasts = load_scheduled_broadcasts()
+    if not broadcasts:
+        return
+    now = datetime.now()
+    changed = False
+    for b in broadcasts:
+        if b.get("sent_at"):
+            continue
+        try:
+            scheduled = datetime.fromisoformat(b["scheduled_at"])
+        except (KeyError, ValueError) as e:
+            log(f"Invalid scheduled broadcast entry: {e}")
+            continue
+        if scheduled > now:
+            continue
+        text = b.get("text", "").strip()
+        if not text:
+            log(f"Skipping scheduled broadcast id={b.get('id')} — empty text")
+            b["sent_at"] = now.isoformat(timespec="seconds")
+            changed = True
+            continue
+        log(f"Sending scheduled broadcast id={b.get('id')} (was due {scheduled.isoformat()})")
+        sent = broadcast(subs_data, text)
+        log(f"  -> sent to {sent}/{len(subs_data['subscribers'])} subscribers")
+        b["sent_at"] = now.isoformat(timespec="seconds")
+        changed = True
+    if changed:
+        save_scheduled_broadcasts(broadcasts)
 
 
 def append_seat_history(match_id: int, categories: list[dict]) -> None:
@@ -375,6 +432,8 @@ def check_seats(match: dict, seat_state: dict, subs_data: dict) -> None:
     mid = match.get("matchId")
     if mid is None:
         return
+    if mid in IGNORED_MATCH_IDS:
+        return
     mid_s = str(mid)
     try:
         categories = fetch_seat_categories(mid)
@@ -487,6 +546,7 @@ def main() -> int:
             seen = check_once(seen, subs_data, seat_state)
             save_seen(seen)
             save_seat_state(seat_state)
+            check_scheduled_broadcasts(subs_data)
             save_subs(subs_data)
         except requests.RequestException as e:
             log(f"Network error: {e}")
