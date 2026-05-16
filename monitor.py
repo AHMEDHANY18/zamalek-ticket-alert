@@ -38,6 +38,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "seen_matches.json"
 SUBS_FILE = DATA_DIR / "subscribers.json"
 SEAT_STATE_FILE = DATA_DIR / "seat_state.json"
+# Append-only history: one JSON line per poll, per match. Used for
+# generating "what changed in the last N hours" reports later.
+SEAT_HISTORY_FILE = DATA_DIR / "seat_history.jsonl"
 LOG_FILE = DATA_DIR / "monitor.log"
 
 ZAMALEK_KEYWORDS = ("zamalek", "zamlek", "زمالك", "الزمالك")
@@ -125,6 +128,30 @@ def save_seat_state(state: dict) -> None:
     SEAT_STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def append_seat_history(match_id: int, categories: list[dict]) -> None:
+    """Append one JSONL line: {ts, matchId, categories:[{tid, name, sold, seats, price}]}."""
+    entry = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "matchId": match_id,
+        "categories": [
+            {
+                "tid": c.get("ticketPriceID"),
+                "name": c.get("categoryNameAr") or c.get("categoryName"),
+                "sold": bool(c.get("soldOut", True)),
+                "seats": int(c.get("availableSeats") or 0),
+                "price": c.get("price"),
+            }
+            for c in categories
+            if c.get("ticketPriceID") is not None
+        ],
+    }
+    try:
+        with SEAT_HISTORY_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log(f"Failed to append seat history: {e}")
 
 
 # ---------- tazkarti ----------
@@ -359,6 +386,8 @@ def check_seats(match: dict, seat_state: dict, subs_data: dict) -> None:
     if not categories:
         log(f"No Zamalek-side categories (teamId={ZAMALEK_TEAM_ID}) for match {mid}")
         return
+
+    append_seat_history(mid, categories)
 
     prev = seat_state.get(mid_s)
     snapshot = {}
