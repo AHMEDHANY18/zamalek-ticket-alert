@@ -388,7 +388,22 @@ def poll_updates(subs_data: dict) -> dict:
     return subs_data
 
 
-def broadcast(subs_data: dict, text: str) -> int:
+def wake_owner(category: dict) -> None:
+    """Spam 5 short pings to OWNER right after a seat alert so a sleeping
+    owner wakes up. The main detailed alert went out via broadcast already."""
+    if not OWNER_CHAT_ID:
+        return
+    cat_name = category.get("categoryNameAr") or category.get("categoryName") or "?"
+    pings = [
+        f"🔔 صحى! تذكرة متاحة: {cat_name} (2/6)",
+        f"🚨 Wake up! {cat_name} متاحة (3/6)",
+        f"⚠️ يلا احجز قبل ما تخلص! (4/6)",
+        f"📢 {cat_name} لسه فاضل وقت — اجري! (5/6)",
+        f"⏰ آخر تنبيه — افتح تذكرتي دلوقتي (6/6)",
+    ]
+    for ping in pings:
+        tg_send(OWNER_CHAT_ID, ping)
+        time.sleep(5)
     """Send text to every subscriber. Returns number of successful sends.
     Removes chats that block the bot (HTTP 403)."""
     subs = subs_data["subscribers"]
@@ -492,6 +507,7 @@ def check_seats(match: dict, seat_state: dict, subs_data: dict) -> None:
         )
         sent = broadcast(subs_data, format_seat_alert(match, c))
         log(f"  -> alerted {sent}/{len(subs_data['subscribers'])} subscribers")
+        wake_owner(c)
 
 
 def check_once(seen: set[int], subs_data: dict, seat_state: dict) -> set[int]:
